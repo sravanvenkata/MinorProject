@@ -2,6 +2,7 @@ package com.example.cappnan
 
 import android.Manifest
 import android.content.Context
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.wifi.aware.*
 import android.os.Build
@@ -11,116 +12,149 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.example.cappnan.ui.AddFriendScreen
 import com.example.cappnan.ui.ChatScreen
-import com.example.cappnan.ui.DeviceListScreen
+import com.example.cappnan.ui.HomeScreen
 import com.example.cappnan.ui.theme.CAppNANTheme
-import java.nio.charset.Charset
+import kotlin.random.Random
 
-// Constants
+// --- CONSTANTS ---
 private const val AWARE_SERVICE_NAME = "MyAwareService"
 private const val TAG = "AwareDebug"
-private const val MSG_PREFIX = "MSG:"
-private const val HANDSHAKE_PREFIX = "HANDSHAKE:"
 
-// DATA CLASSES
-data class ChatMessage(
-    val text: String,
-    val isFromMe: Boolean,
-    val senderName: String,
-    val timestamp: Long = System.currentTimeMillis()
-)
+// PROTOCOLS
+private const val REQ_PREFIX = "REQ:"   // "REQ:1234:Samsung"
+private const val ACK_PREFIX = "ACK:"   // "ACK:5678:Pixel"
+private const val MSG_PREFIX = "MSG:"   // "MSG:1234:Hello"
 
-// FIX: This class remembers WHICH session allows us to talk to this person
-data class PeerConnection(
-    val handle: PeerHandle,
-    val session: DiscoverySession // Can be PublishDiscoverySession OR SubscribeDiscoverySession
-)
+data class ChatMessage(val text: String, val isFromMe: Boolean, val senderName: String, val timestamp: Long = System.currentTimeMillis())
+data class PeerConnection(val handle: PeerHandle, val session: DiscoverySession)
 
 class MainActivity : ComponentActivity() {
 
     private var wifiAwareManager: WifiAwareManager? = null
     private var wifiAwareSession: WifiAwareSession? = null
-
-    // We keep specific references just to keep sessions alive
     private var publishSessionRef: PublishDiscoverySession? = null
     private var subscribeSessionRef: SubscribeDiscoverySession? = null
 
-    // FIX: Map Name -> The Exact Connection Info (Handle + Session)
-    private val connectedPeers = mutableStateMapOf<String, PeerConnection>()
+    // MY IDENTITY
+    private var myId: String = ""
+    private var myName: String = ""
+
+    // STATE
+    private val discoveredStrangers = mutableStateMapOf<String, PeerConnection>() // Temporary (Add Friend Screen)
+    private val friendsList = mutableStateMapOf<String, PeerConnection>() // Permanent (Home Screen)
 
     private val allMessages = mutableStateListOf<ChatMessage>()
     private var currentChatTarget: String? = null
 
-    // Message ID counter to prevent de-duplication drops
-    private var messageIdCounter = 100
+    // Popup State
+    private var showConnectionRequest by mutableStateOf(false)
+    private var requestSenderName by mutableStateOf("")
+    private var requestSenderHandle: PeerHandle? = null
+    private var requestSession: DiscoverySession? = null
 
     private val requestPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
-            if (permissions.all { it.value }) attachToWifiAware()
-            else Toast.makeText(this, "Permissions denied", Toast.LENGTH_SHORT).show()
-        }
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { if (it.all { p -> p.value }) attachToWifiAware() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 1. GENERATE ID (4 Digits)
+        val prefs: SharedPreferences = getSharedPreferences("AppPrefs", MODE_PRIVATE)
+        var storedId = prefs.getString("MY_ID", null)
+        if (storedId == null) {
+            storedId = Random.nextInt(1000, 9999).toString()
+            prefs.edit().putString("MY_ID", storedId).apply()
+        }
+        myId = storedId
+        myName = "${Build.MODEL} ($myId)"
+
         wifiAwareManager = getSystemService(Context.WIFI_AWARE_SERVICE) as? WifiAwareManager
 
         setContent {
             CAppNANTheme {
                 val navController = rememberNavController()
-                NavHost(navController = navController, startDestination = "device_list") {
 
-                    composable("device_list") {
-                        DeviceListScreen(
-                            deviceNames = connectedPeers.keys.toList(),
-                            onDeviceClick = { name ->
+                // CONNECTION REQUEST POPUP
+                if (showConnectionRequest) {
+                    AlertDialog(
+                        onDismissRequest = { showConnectionRequest = false },
+                        title = { Text("Friend Request") },
+                        text = { Text("$requestSenderName wants to connect.") },
+                        confirmButton = {
+                            Button(onClick = {
+                                acceptConnection()
+                                showConnectionRequest = false
+                            }) { Text("Allow") }
+                        },
+                        dismissButton = {
+                            Button(onClick = { showConnectionRequest = false }) { Text("Deny") }
+                        }
+                    )
+                }
+
+                NavHost(navController = navController, startDestination = "home") {
+
+                    // SCREEN 1: HOME (Friend List)
+                    composable("home") {
+                        HomeScreen(
+                            myId = myId,
+                            friends = friendsList.keys.toList(),
+                            onChatClick = { name ->
                                 currentChatTarget = name
                                 navController.navigate("chat")
-                            }
+                            },
+                            onAddFriendClick = { navController.navigate("add_friend") }
                         )
                     }
 
+                    // SCREEN 2: ADD FRIEND
+                    composable("add_friend") {
+                        // Show devices that are NOT already friends
+                        val strangers = discoveredStrangers.keys.filter { !friendsList.containsKey(it) }
+                        AddFriendScreen(
+                            discoveredDevices = strangers,
+                            onConnectClick = { name -> sendConnectionRequest(name) },
+                            onBack = { navController.popBackStack() }
+                        )
+                    }
+
+                    // SCREEN 3: CHAT
                     composable("chat") {
                         val target = currentChatTarget ?: "Unknown"
-                        val filteredMessages = allMessages.filter {
-                            it.senderName == target || (it.isFromMe && it.senderName == target)
-                        }.sortedBy { it.timestamp }
-
+                        val msgs = allMessages.filter { it.senderName == target || (it.isFromMe && it.senderName == target) }
                         ChatScreen(
                             peerName = target,
-                            messages = filteredMessages,
-                            onSendMessage = { msg -> sendMessage(msg) },
+                            messages = msgs,
+                            onSendMessage = { sendMessage(it) },
                             onBack = { navController.popBackStack() }
                         )
                     }
                 }
             }
         }
-
         if (wifiAwareManager != null) requestPermissions()
-        else Toast.makeText(this, "Hardware not supported", Toast.LENGTH_LONG).show()
     }
 
+    // --- PERMISSIONS & SETUP ---
     private fun requestPermissions() {
-        val permissions = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
-        }
-        if (permissions.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }) {
-            attachToWifiAware()
-        } else {
-            requestPermissionLauncher.launch(permissions.toTypedArray())
-        }
+        val perms = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+        if (perms.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }) attachToWifiAware()
+        else requestPermissionLauncher.launch(perms.toTypedArray())
     }
 
-    private fun attachToWifiAware() {
-        if (wifiAwareManager?.isAvailable == true) attach()
-    }
+    private fun attachToWifiAware() { if (wifiAwareManager?.isAvailable == true) attach() }
 
     private fun attach() {
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return
@@ -129,118 +163,111 @@ class MainActivity : ComponentActivity() {
                 wifiAwareSession = session
                 publish()
                 subscribe()
-                Toast.makeText(applicationContext, "Session Active: ${Build.MODEL}", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "ID: $myId Active", Toast.LENGTH_LONG).show()
             }
         }, null)
     }
 
     private fun publish() {
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return
-        val config = PublishConfig.Builder()
-            .setServiceName(AWARE_SERVICE_NAME)
-            .setServiceSpecificInfo(Build.MODEL.toByteArray())
-            .build()
-
+        val config = PublishConfig.Builder().setServiceName(AWARE_SERVICE_NAME).setServiceSpecificInfo(myName.toByteArray()).build()
         wifiAwareSession?.publish(config, object : DiscoverySessionCallback() {
-            override fun onPublishStarted(session: PublishDiscoverySession) {
-                publishSessionRef = session
-            }
-            override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) {
-                // IMPORTANT: Pass the session that received this message
-                handleIncomingMessage(peerHandle, message, session = publishSessionRef!!)
-            }
+            override fun onPublishStarted(session: PublishDiscoverySession) { publishSessionRef = session }
+            override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) { handleIncomingMessage(peerHandle, message, publishSessionRef!!) }
         }, null)
     }
 
     private fun subscribe() {
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return
         val config = SubscribeConfig.Builder().setServiceName(AWARE_SERVICE_NAME).build()
-
         wifiAwareSession?.subscribe(config, object : DiscoverySessionCallback() {
-            override fun onSubscribeStarted(session: SubscribeDiscoverySession) {
-                subscribeSessionRef = session
-            }
-
+            override fun onSubscribeStarted(session: SubscribeDiscoverySession) { subscribeSessionRef = session }
             override fun onServiceDiscovered(peerHandle: PeerHandle, serviceSpecificInfo: ByteArray, matchFilter: List<ByteArray>) {
-                val peerName = String(serviceSpecificInfo)
-
-                // Save connection using THIS Subscribe Session
-                connectedPeers[peerName] = PeerConnection(peerHandle, subscribeSessionRef!!)
-
-                // Send Handshake
-                val myHandshake = "$HANDSHAKE_PREFIX${Build.MODEL}"
-                try {
-                    subscribeSessionRef?.sendMessage(peerHandle, messageIdCounter++, myHandshake.toByteArray())
-                } catch (e: Exception) { Log.e(TAG, "Handshake failed", e) }
+                val peerName = String(serviceSpecificInfo) // Name from Service Info
+                // Add to Strangers list initially
+                discoveredStrangers[peerName] = PeerConnection(peerHandle, subscribeSessionRef!!)
             }
-
-            override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) {
-                // IMPORTANT: Pass the session that received this message
-                handleIncomingMessage(peerHandle, message, session = subscribeSessionRef!!)
-            }
+            override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) { handleIncomingMessage(peerHandle, message, subscribeSessionRef!!) }
         }, null)
     }
 
-    // --- LOGIC: STRICT SESSION TRACKING ---
-    private fun handleIncomingMessage(peerHandle: PeerHandle, message: ByteArray, session: DiscoverySession) {
-        val rawText = String(message)
+    // --- LOGIC: REQUEST / ACCEPT / CHAT ---
 
-        if (rawText.startsWith(HANDSHAKE_PREFIX)) {
-            val peerName = rawText.removePrefix(HANDSHAKE_PREFIX)
-            // UPDATE: We now know exactly which session to use to reply to this person
-            connectedPeers[peerName] = PeerConnection(peerHandle, session)
-            Log.d(TAG, "Handshake from $peerName on ${session.javaClass.simpleName}")
+    private fun sendConnectionRequest(targetName: String) {
+        val conn = discoveredStrangers[targetName] ?: return
+        val payload = "$REQ_PREFIX$myName" // "REQ:Samsung (1234)"
+        try {
+            conn.session.sendMessage(conn.handle, 0, payload.toByteArray())
+            Toast.makeText(this, "Request sent to $targetName", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) { Log.e(TAG, "Req fail", e) }
+    }
+
+    private fun acceptConnection() {
+        val handle = requestSenderHandle ?: return
+        val session = requestSession ?: return
+        val name = requestSenderName
+
+        // 1. Add to Friends
+        friendsList[name] = PeerConnection(handle, session)
+
+        // 2. Send Acceptance ACK
+        val payload = "$ACK_PREFIX$myName" // "ACK:Pixel (5678)"
+        try {
+            session.sendMessage(handle, 0, payload.toByteArray())
+            Toast.makeText(this, "Connected with $name", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) { Log.e(TAG, "Ack fail", e) }
+    }
+
+    private fun handleIncomingMessage(handle: PeerHandle, message: ByteArray, session: DiscoverySession) {
+        val text = String(message)
+
+        // CASE 1: CONNECTION REQUEST ("REQ:Samsung (1234)")
+        if (text.startsWith(REQ_PREFIX)) {
+            val sender = text.removePrefix(REQ_PREFIX)
+            // Update Stranger list just in case
+            discoveredStrangers[sender] = PeerConnection(handle, session)
+
+            // Show Popup
+            requestSenderName = sender
+            requestSenderHandle = handle
+            requestSession = session
+            showConnectionRequest = true
         }
-        else if (rawText.startsWith(MSG_PREFIX)) {
+
+        // CASE 2: CONNECTION ACCEPTED ("ACK:Pixel (5678)")
+        else if (text.startsWith(ACK_PREFIX)) {
+            val sender = text.removePrefix(ACK_PREFIX)
+            friendsList[sender] = PeerConnection(handle, session) // Move to Friends
+            runOnUiThread { Toast.makeText(this, "$sender accepted!", Toast.LENGTH_SHORT).show() }
+        }
+
+        // CASE 3: CHAT MESSAGE ("MSG:Samsung:Hello")
+        else if (text.startsWith(MSG_PREFIX)) {
             try {
-                val parts = rawText.split(":", limit = 3)
+                val parts = text.split(":", limit = 3) // MSG : Name : Body
                 if (parts.size == 3) {
                     val senderName = parts[1]
-                    val actualMsg = parts[2]
+                    val body = parts[2]
 
-                    // UPDATE: Ensure we map this sender to this session
-                    connectedPeers[senderName] = PeerConnection(peerHandle, session)
+                    // Ensure they are in friends list (implicit update)
+                    friendsList[senderName] = PeerConnection(handle, session)
 
-                    runOnUiThread {
-                        allMessages.add(ChatMessage(actualMsg, isFromMe = false, senderName = senderName))
-                    }
+                    runOnUiThread { allMessages.add(ChatMessage(body, false, senderName)) }
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error parsing message", e)
-            }
+            } catch (e: Exception) { }
         }
     }
 
-    // --- LOGIC: NO MORE GUESSING ---
     private fun sendMessage(text: String) {
-        val targetName = currentChatTarget ?: return
+        val target = currentChatTarget ?: return
+        val conn = friendsList[target] ?: return // Can only chat with friends
 
-        // 1. Get the EXACT connection object (Handle + Session)
-        val connection = connectedPeers[targetName]
-
-        if (connection == null) {
-            Toast.makeText(this, "Lost connection to $targetName", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val payload = "$MSG_PREFIX${Build.MODEL}:$text"
-        val bytes = payload.toByteArray()
-
+        val payload = "$MSG_PREFIX$myName:$text"
         try {
-            // 2. Use the stored session directly. No try/catch spraying.
-            connection.session.sendMessage(connection.handle, messageIdCounter++, bytes)
-
-            runOnUiThread {
-                allMessages.add(ChatMessage(text, isFromMe = true, senderName = targetName))
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Send failed", e)
-            Toast.makeText(this, "Send failed: ${e.message}", Toast.LENGTH_SHORT).show()
-        }
+            conn.session.sendMessage(conn.handle, 0, payload.toByteArray())
+            allMessages.add(ChatMessage(text, true, target))
+        } catch (e: Exception) { Toast.makeText(this, "Send Failed", Toast.LENGTH_SHORT).show() }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        wifiAwareSession?.close()
-    }
+    override fun onDestroy() { super.onDestroy(); wifiAwareSession?.close() }
 }

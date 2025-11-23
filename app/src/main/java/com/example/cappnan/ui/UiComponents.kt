@@ -9,9 +9,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Person
-import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -22,76 +20,115 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.cappnan.ChatMessage
 
-// --- SCREEN 1: DEVICE LIST ---
-
+// --- SCREEN 1: HOME (FRIENDS LIST) ---
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DeviceListScreen(
-    deviceNames: List<String>,
-    onDeviceClick: (String) -> Unit
+fun HomeScreen(
+    myId: String,
+    friends: List<String>, // List of permanent friends
+    onChatClick: (String) -> Unit,
+    onAddFriendClick: () -> Unit
 ) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Nearby Devices") },
+                title = { Text("My ID: $myId") },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                )
+            )
+        },
+        floatingActionButton = {
+            FloatingActionButton(onClick = onAddFriendClick) {
+                Icon(Icons.Default.Add, contentDescription = "Add Friend")
+            }
+        }
+    ) { padding ->
+        if (friends.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+                Text("No friends yet. Click + to add.")
+            }
+        } else {
+            LazyColumn(modifier = Modifier.padding(padding)) {
+                items(friends) { name ->
+                    FriendItem(name = name, onClick = { onChatClick(name) })
+                }
+            }
+        }
+    }
+}
+
+// --- SCREEN 2: ADD FRIEND (SCANNER) ---
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AddFriendScreen(
+    discoveredDevices: List<String>,
+    onConnectClick: (String) -> Unit,
+    onBack: () -> Unit
+) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Nearby Strangers") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer
                 )
             )
         }
     ) { padding ->
-        if (deviceNames.isEmpty()) {
+        if (discoveredDevices.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     CircularProgressIndicator()
                     Spacer(modifier = Modifier.height(16.dp))
-                    Text("Scanning for peers...")
+                    Text("Scanning...")
                 }
             }
         } else {
             LazyColumn(modifier = Modifier.padding(padding)) {
-                items(deviceNames) { name ->
-                    DeviceItem(name = name, onClick = { onDeviceClick(name) })
+                items(discoveredDevices) { name ->
+                    DiscoveredItem(name = name, onAdd = { onConnectClick(name) })
                 }
             }
+        }
+    }
+}
+
+// --- COMPONENTS ---
+@Composable
+fun FriendItem(name: String, onClick: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(8.dp).clickable { onClick() },
+        elevation = CardDefaults.cardElevation(2.dp)
+    ) {
+        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Person, null, modifier = Modifier.size(40.dp))
+            Spacer(modifier = Modifier.width(16.dp))
+            Text(name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         }
     }
 }
 
 @Composable
-fun DeviceItem(name: String, onClick: () -> Unit) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(8.dp)
-            .clickable { onClick() },
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-    ) {
+fun DiscoveredItem(name: String, onAdd: () -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth().padding(8.dp)) {
         Row(
             modifier = Modifier.padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Icon(
-                imageVector = Icons.Default.Person,
-                contentDescription = null,
-                modifier = Modifier
-                    .size(40.dp)
-                    .background(MaterialTheme.colorScheme.secondaryContainer, CircleShape)
-                    .padding(8.dp)
-            )
-            Spacer(modifier = Modifier.width(16.dp))
-            Text(
-                text = name,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold
-            )
+            Text(name, style = MaterialTheme.typography.bodyLarge)
+            Button(onClick = onAdd) { Text("Connect") }
         }
     }
 }
 
-// --- SCREEN 2: CHAT SCREEN ---
-
+// --- SCREEN 3: CHAT (Existing) ---
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
@@ -103,74 +140,31 @@ fun ChatScreen(
     var textState by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
-    // Auto-scroll to bottom when messages change
     LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.size - 1)
-        }
+        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
     }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text(peerName) },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer
-                )
+                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) } }
             )
         }
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-        ) {
-            // Message List
-            LazyColumn(
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(horizontal = 8.dp),
-                state = listState
-            ) {
-                items(messages) { msg ->
-                    MessageBubble(message = msg)
-                }
+        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+            LazyColumn(modifier = Modifier.weight(1f).padding(8.dp), state = listState) {
+                items(messages) { msg -> MessageBubble(msg) }
             }
-
-            // Input Field
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+            Row(modifier = Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 TextField(
-                    value = textState,
-                    onValueChange = { textState = it },
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Type a message") },
+                    value = textState, onValueChange = { textState = it },
+                    modifier = Modifier.weight(1f), placeholder = { Text("Type...") },
                     shape = RoundedCornerShape(24.dp),
-                    colors = TextFieldDefaults.colors(
-                        focusedIndicatorColor = Color.Transparent,
-                        unfocusedIndicatorColor = Color.Transparent
-                    )
+                    colors = TextFieldDefaults.colors(focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent)
                 )
-                Spacer(modifier = Modifier.width(8.dp))
-                FloatingActionButton(
-                    onClick = {
-                        if (textState.isNotBlank()) {
-                            onSendMessage(textState)
-                            textState = ""
-                        }
-                    },
-                    containerColor = MaterialTheme.colorScheme.primary
-                ) {
-                    Icon(Icons.Default.Send, contentDescription = "Send")
+                IconButton(onClick = { if(textState.isNotBlank()) { onSendMessage(textState); textState = "" } }) {
+                    Icon(Icons.Default.Send, null, tint = MaterialTheme.colorScheme.primary)
                 }
             }
         }
@@ -180,30 +174,12 @@ fun ChatScreen(
 @Composable
 fun MessageBubble(message: ChatMessage) {
     val isMe = message.isFromMe
-
-    Box(
-        modifier = Modifier.fillMaxWidth(),
-        contentAlignment = if (isMe) Alignment.CenterEnd else Alignment.CenterStart
-    ) {
+    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = if (isMe) Alignment.CenterEnd else Alignment.CenterStart) {
         Surface(
             color = if (isMe) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondaryContainer,
-            shape = RoundedCornerShape(
-                topStart = 16.dp,
-                topEnd = 16.dp,
-                bottomStart = if (isMe) 16.dp else 2.dp,
-                bottomEnd = if (isMe) 2.dp else 16.dp
-            ),
-            modifier = Modifier
-                .widthIn(max = 280.dp)
-                .padding(vertical = 4.dp)
+            shape = RoundedCornerShape(8.dp), modifier = Modifier.padding(4.dp).widthIn(max = 280.dp)
         ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                Text(
-                    text = message.text,
-                    color = if (isMe) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSecondaryContainer,
-                    fontSize = 16.sp
-                )
-            }
+            Text(message.text, modifier = Modifier.padding(10.dp), color = if (isMe) Color.White else Color.Black)
         }
     }
 }
