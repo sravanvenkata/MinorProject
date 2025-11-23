@@ -1,12 +1,10 @@
 package com.example.cappnan.ui
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -17,15 +15,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import com.example.cappnan.ChatMessage
+import com.example.cappnan.ChatMessage // Now imports correctly from AppUtils.kt
 
-// --- SCREEN 1: HOME (FRIENDS LIST) ---
+// --- SCREEN 1: HOME (FRIEND LIST) ---
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
     myId: String,
-    friends: List<String>, // List of permanent friends
+    friends: List<String>,
     onChatClick: (String) -> Unit,
     onAddFriendClick: () -> Unit
 ) {
@@ -58,7 +55,7 @@ fun HomeScreen(
     }
 }
 
-// --- SCREEN 2: ADD FRIEND (SCANNER) ---
+// --- SCREEN 2: ADD FRIEND ---
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AddFriendScreen(
@@ -99,36 +96,7 @@ fun AddFriendScreen(
     }
 }
 
-// --- COMPONENTS ---
-@Composable
-fun FriendItem(name: String, onClick: () -> Unit) {
-    Card(
-        modifier = Modifier.fillMaxWidth().padding(8.dp).clickable { onClick() },
-        elevation = CardDefaults.cardElevation(2.dp)
-    ) {
-        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.Person, null, modifier = Modifier.size(40.dp))
-            Spacer(modifier = Modifier.width(16.dp))
-            Text(name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-        }
-    }
-}
-
-@Composable
-fun DiscoveredItem(name: String, onAdd: () -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth().padding(8.dp)) {
-        Row(
-            modifier = Modifier.padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(name, style = MaterialTheme.typography.bodyLarge)
-            Button(onClick = onAdd) { Text("Connect") }
-        }
-    }
-}
-
-// --- SCREEN 3: CHAT (Existing) ---
+// --- SCREEN 3: CHAT ---
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
@@ -167,6 +135,35 @@ fun ChatScreen(
                     Icon(Icons.Default.Send, null, tint = MaterialTheme.colorScheme.primary)
                 }
             }
+        }
+    }
+}
+
+// --- ITEMS ---
+@Composable
+fun FriendItem(name: String, onClick: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(8.dp).clickable { onClick() },
+        elevation = CardDefaults.cardElevation(2.dp)
+    ) {
+        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Person, null, modifier = Modifier.size(40.dp))
+            Spacer(modifier = Modifier.width(16.dp))
+            Text(name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+fun DiscoveredItem(name: String, onAdd: () -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth().padding(8.dp)) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(name, style = MaterialTheme.typography.bodyLarge)
+            Button(onClick = onAdd) { Text("Connect") }
         }
     }
 }
