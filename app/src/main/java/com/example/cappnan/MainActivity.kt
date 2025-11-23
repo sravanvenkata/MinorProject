@@ -26,6 +26,14 @@ import com.example.cappnan.ui.ChatScreen
 import com.example.cappnan.ui.HomeScreen
 import com.example.cappnan.ui.theme.CAppNANTheme
 import kotlin.random.Random
+import com.example.cappnan.data.AppDatabase
+import com.example.cappnan.data.Message
+import com.example.cappnan.data.MessageDao
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.map // Essential for converting DB Entity to UI Model
+
 
 // --- CONSTANTS ---
 private const val AWARE_SERVICE_NAME = "MyAwareService"
@@ -36,13 +44,17 @@ private const val REQ_PREFIX = "REQ:"
 private const val ACK_PREFIX = "ACK:"
 
 
-
 class MainActivity : ComponentActivity() {
 
     private var wifiAwareManager: WifiAwareManager? = null
     private var wifiAwareSession: WifiAwareSession? = null
     private var publishSessionRef: PublishDiscoverySession? = null
     private var subscribeSessionRef: SubscribeDiscoverySession? = null
+
+    // --- DATABASE STATE ---
+    private lateinit var database: AppDatabase
+    private lateinit var messageDao: MessageDao
+    private val coroutineScope = CoroutineScope(Dispatchers.IO) // For database operations
 
     // IDENTITY
     private var myId: String = "" // "4592"
@@ -52,9 +64,7 @@ class MainActivity : ComponentActivity() {
     // UI STATE
     private val discoveredStrangers = mutableStateMapOf<String, PeerConnection>()
     private val friendsList = mutableStateMapOf<String, PeerConnection>()
-    private val allMessages = mutableStateListOf<ChatMessage>()
 
-    // FIX 2: Variable was missing in your snippets
     private var currentChatTarget: String? = null
 
     // AODV STATE
@@ -85,6 +95,10 @@ class MainActivity : ComponentActivity() {
         myId = storedId!!
         myNodeId = myId.toInt()
         myName = "${Build.MODEL} ($myId)"
+
+        // 2. Initialize Database and DAO (Essential for persistence)
+        database = AppDatabase.getDatabase(this)
+        messageDao = database.messageDao()
 
         wifiAwareManager = getSystemService(Context.WIFI_AWARE_SERVICE) as? WifiAwareManager
 
@@ -124,11 +138,22 @@ class MainActivity : ComponentActivity() {
                     }
                     composable("chat") {
                         val target = currentChatTarget ?: "Unknown"
-                        val msgs = allMessages.filter { it.senderName == target || (it.isFromMe && it.senderName == target) }
+
+                        // --- CORRECT PERSISTENCE: FLOW OBSERVATION ---
+                        // 1. Get the Flow from the DAO (This watches the database in real-time)
+                        val messageFlow = remember(target) {
+                            messageDao.getMessagesForChat(target).map { dbList ->
+                                dbList.map { it.toChatMessage() } // Convert DB Entities to UI ChatMessages
+                            }
+                        }
+                        // 2. Collect the Flow as a Compose State
+                        val msgs by messageFlow.collectAsState(initial = emptyList())
+                        // --- END PERSISTENCE FIX ---
+
                         ChatScreen(
                             peerName = target,
-                            messages = msgs,
-                            onSendMessage = { msg -> sendMessage(msg) }, // Calls the UI-facing sendMessage
+                            messages = msgs, // This list is now the persistent, real-time data
+                            onSendMessage = { msg -> sendMessage(msg) },
                             onBack = { navController.popBackStack() }
                         )
                     }
@@ -138,7 +163,7 @@ class MainActivity : ComponentActivity() {
         if (wifiAwareManager != null) requestPermissions()
     }
 
-    // --- SETUP ---
+    // --- SETUP (No changes) ---
     private fun requestPermissions() {
         val perms = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
@@ -179,18 +204,14 @@ class MainActivity : ComponentActivity() {
     }
 
     // --- INCOMING HANDLER (SWITCHBOARD) ---
-    // --- INCOMING HANDLER (SWITCHBOARD) ---
     private fun handleIncomingMessage(handle: PeerHandle, message: ByteArray, session: DiscoverySession) {
         val text = String(message)
 
-        // FIX: Check for Text Prefixes FIRST.
-        // If it starts with "REQ:" or "ACK:", handle it as a Friend Request immediately.
         if (text.startsWith(REQ_PREFIX) || text.startsWith(ACK_PREFIX)) {
             handleLegacyStringMessage(text, handle, session)
             return
         }
 
-        // If it wasn't a text command, TRY to parse as Binary AODV Packet
         val packet = PacketManager.parsePacket(message)
 
         if (packet != null) {
@@ -198,7 +219,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // --- LEGACY FRIEND LOGIC ---
+    // --- LEGACY FRIEND LOGIC (No changes) ---
     private fun handleLegacyStringMessage(text: String, handle: PeerHandle, session: DiscoverySession) {
         if (text.startsWith(REQ_PREFIX)) {
             val sender = text.removePrefix(REQ_PREFIX)
@@ -254,7 +275,22 @@ class MainActivity : ComponentActivity() {
             TYPE_DATA -> {
                 if (packet.destId == myNodeId) {
                     val senderName = friendsList.keys.find { it.contains(packet.sourceId.toString()) } ?: "User ${packet.sourceId}"
-                    runOnUiThread { allMessages.add(ChatMessage(packet.getPayloadString(), false, senderName)) }
+                    val content = packet.getPayloadString()
+
+                    // --- SAVE INCOMING MESSAGE TO DB (Persistence) ---
+                    val messageEntity = Message(
+                        senderId = senderName,
+                        receiverId = myName, // Your own device name/ID
+                        content = content,
+                        timestamp = System.currentTimeMillis(),
+                        isIncoming = true,
+                        partnerName = senderName
+                    )
+                    coroutineScope.launch {
+                        messageDao.insertMessage(messageEntity)
+                    }
+                    // --- END DB SAVE ---
+
                 } else {
                     forwardPacketToNextHop(packet)
                 }
@@ -264,7 +300,7 @@ class MainActivity : ComponentActivity() {
 
     private fun sendRREP(originId: Int, handle: PeerHandle, session: DiscoverySession) {
         packetSequenceNumber++
-        val bytes = PacketManager.createPacket(TYPE_RREP, myNodeId, originId, packetSequenceNumber, 0, "")
+        val bytes = PacketManager.createPacket(TYPE_RREP, myNodeId, originId, packetSequenceNumber, 0.toByte(), "")
         try { session.sendMessage(handle, 0, bytes) } catch (e: Exception) {}
     }
 
@@ -281,61 +317,72 @@ class MainActivity : ComponentActivity() {
         try { nextHop.nextHopSession.sendMessage(nextHop.nextHopHandle, 0, bytes) } catch(e:Exception){}
     }
 
-    // --- UI SEND ACTION ---
-    // FIX 1: This is the missing function!
-    // REPLACE your sendMessage function with this (Uncommented):
-    // REPLACE your sendMessage function with this (Uncommented):
-    private fun sendMessage(text: String) {
-        val targetName = currentChatTarget ?: return
-
-        // Logic: Extract ID from "Samsung (4592)" -> 4592
-        val idString = targetName.substringAfterLast("(").substringBefore(")")
-        val targetId = idString.toIntOrNull()
-
-        if (targetId != null) {
-            // This triggers the AODV routing
-            sendRoutedMessage(text, targetId)
-        } else {
-            Toast.makeText(this, "Invalid Target ID", Toast.LENGTH_SHORT).show()
+    private fun flushMessageBuffer(targetId: Int) {
+        val queue = messageBuffer[targetId] ?: return
+        val route = routingTable[targetId] ?: return
+        queue.forEach {
+            // Send each message in the buffer as a data packet
+            sendDataPacket(route.nextHopHandle, route.nextHopSession, myNodeId, targetId, it)
         }
+        messageBuffer.remove(targetId)
     }
 
-    private fun sendRoutedMessage(text: String, targetId: Int) {
+    // --- UI SEND ACTION ---
+    private fun sendMessage(text: String) {
+        val targetName = currentChatTarget ?: return
+        val targetId = try {
+            targetName.substringAfterLast("(").substringBefore(")").toInt()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Invalid Target ID", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        // 1. Save outgoing message to DB immediately (Persistence)
+        coroutineScope.launch {
+            messageDao.insertMessage(
+                Message(
+                    senderId = myName,
+                    receiverId = targetName,
+                    content = text,
+                    timestamp = System.currentTimeMillis(),
+                    isIncoming = false,
+                    partnerName = targetName
+                )
+            )
+        }
+
+        // 2. Network Logic (AODV)
         val route = routingTable[targetId]
         if (route != null) {
+            // We have a route! Send DATA packet immediately using the next hop.
             sendDataPacket(route.nextHopHandle, route.nextHopSession, myNodeId, targetId, text)
         } else {
+            // No route? Buffer message and Flood RREQ
             if (!messageBuffer.containsKey(targetId)) messageBuffer[targetId] = mutableListOf()
             messageBuffer[targetId]?.add(text)
             broadcastRREQ(targetId)
         }
     }
 
+    // --- RESTORED MISSING FUNCTIONS (Essential for AODV) ---
     private fun broadcastRREQ(targetId: Int) {
         packetSequenceNumber++
-        val bytes = PacketManager.createPacket(TYPE_RREQ, myNodeId, targetId, packetSequenceNumber, 0, "")
+        val bytes = PacketManager.createPacket(TYPE_RREQ, myNodeId, targetId, packetSequenceNumber, 0.toByte(), "")
         friendsList.values.forEach { try { it.session.sendMessage(it.handle, 0, bytes) } catch (e: Exception) {} }
     }
 
     private fun sendDataPacket(handle: PeerHandle, session: DiscoverySession, src: Int, dst: Int, text: String) {
         packetSequenceNumber++
-        val bytes = PacketManager.createPacket(TYPE_DATA, src, dst, packetSequenceNumber, 0, text)
+        val bytes = PacketManager.createPacket(TYPE_DATA, src, dst, packetSequenceNumber, 0.toByte(), text)
         try {
             session.sendMessage(handle, 0, bytes)
-            // UI Update for Self
-            if (src == myNodeId) {
-                val name = friendsList.keys.find { it.contains(dst.toString()) } ?: dst.toString()
-                runOnUiThread { allMessages.add(ChatMessage(text, true, name)) }
-            }
-        } catch(e:Exception){}
+        } catch(e:Exception){
+            Log.e(TAG, "Failed to send data packet: ${e.message}")
+            runOnUiThread { Toast.makeText(this, "Failed to send to next hop.", Toast.LENGTH_SHORT).show() }
+        }
     }
+    // --- END RESTORED FUNCTIONS ---
 
-    private fun flushMessageBuffer(targetId: Int) {
-        val queue = messageBuffer[targetId] ?: return
-        val route = routingTable[targetId] ?: return
-        queue.forEach { sendDataPacket(route.nextHopHandle, route.nextHopSession, myNodeId, targetId, it) }
-        messageBuffer.remove(targetId)
-    }
 
     override fun onDestroy() { super.onDestroy(); wifiAwareSession?.close() }
 }
