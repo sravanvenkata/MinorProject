@@ -16,20 +16,83 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.cappnan.ChatMessage // Now imports correctly from AppUtils.kt
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.foundation.Image
+import androidx.compose.ui.window.Dialog
+import com.example.cappnan.generateQrCodeBitmap
+import android.util.Size
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.MultiFormatReader
+import com.google.zxing.PlanarYUVLuminanceSource
+import com.google.zxing.common.HybridBinarizer
+import com.google.zxing.RGBLuminanceSource
 
 // --- SCREEN 1: HOME (FRIEND LIST) ---
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
     myId: String,
+    myName: String,
+    myPublicKey: String, // We now pass the public key to the UI
     friends: List<String>,
     onChatClick: (String) -> Unit,
     onAddFriendClick: () -> Unit
 ) {
+    var showQrDialog by remember { mutableStateOf(false) }
+
+    // This is the specific data format your friend's phone will read
+    val qrDataString = "MESH:$myId:$myName:$myPublicKey"
+
+    if (showQrDialog) {
+        Dialog(onDismissRequest = { showQrDialog = false }) {
+            Card(
+                modifier = Modifier.padding(16.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White)
+            ) {
+                Column(
+                    modifier = Modifier.padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text("Scan to add me", fontWeight = FontWeight.Bold, color = Color.Black)
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Generate and show the QR Image
+                    val qrBitmap = remember { generateQrCodeBitmap(qrDataString) }
+                    qrBitmap?.let {
+                        Image(
+                            bitmap = it.asImageBitmap(),
+                            contentDescription = "My QR Code",
+                            modifier = Modifier.size(250.dp)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Button(onClick = { showQrDialog = false }) { Text("Close") }
+                }
+            }
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("My ID: $myId") },
+                actions = {
+                    // New Button to show QR Code
+                    IconButton(onClick = { showQrDialog = true }) {
+                        Icon(Icons.Default.Share, contentDescription = "Show QR Code")
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer
                 )
@@ -56,45 +119,7 @@ fun HomeScreen(
 }
 
 // --- SCREEN 2: ADD FRIEND ---
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun AddFriendScreen(
-    discoveredDevices: List<String>,
-    onConnectClick: (String) -> Unit,
-    onBack: () -> Unit
-) {
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Nearby Strangers") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.secondaryContainer
-                )
-            )
-        }
-    ) { padding ->
-        if (discoveredDevices.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator()
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text("Scanning...")
-                }
-            }
-        } else {
-            LazyColumn(modifier = Modifier.padding(padding)) {
-                items(discoveredDevices) { name ->
-                    DiscoveredItem(name = name, onAdd = { onConnectClick(name) })
-                }
-            }
-        }
-    }
-}
+
 
 // --- SCREEN 3: CHAT ---
 @OptIn(ExperimentalMaterial3Api::class)
@@ -154,19 +179,7 @@ fun FriendItem(name: String, onClick: () -> Unit) {
     }
 }
 
-@Composable
-fun DiscoveredItem(name: String, onAdd: () -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth().padding(8.dp)) {
-        Row(
-            modifier = Modifier.padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(name, style = MaterialTheme.typography.bodyLarge)
-            Button(onClick = onAdd) { Text("Connect") }
-        }
-    }
-}
+
 
 @Composable
 fun MessageBubble(message: ChatMessage) {
@@ -178,5 +191,84 @@ fun MessageBubble(message: ChatMessage) {
         ) {
             Text(message.text, modifier = Modifier.padding(10.dp), color = if (isMe) Color.White else Color.Black)
         }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ScanQrScreen(
+    onQrScanned: (String) -> Unit,
+    onBack: () -> Unit
+) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var hasScanned by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Scan Friend's QR") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Back") }
+                }
+            )
+        }
+    ) { padding ->
+        AndroidView(
+            modifier = Modifier.fillMaxSize().padding(padding),
+            factory = { context ->
+                val previewView = PreviewView(context)
+                val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+
+                cameraProviderFuture.addListener({
+                    val cameraProvider = cameraProviderFuture.get()
+                    val preview = Preview.Builder().build().also {
+                        it.setSurfaceProvider(previewView.surfaceProvider)
+                    }
+
+                    val imageAnalysis = ImageAnalysis.Builder()
+                        .setTargetResolution(Size(1280, 720))
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .build()
+
+                    imageAnalysis.setAnalyzer(ContextCompat.getMainExecutor(context)) { imageProxy ->
+                        if (!hasScanned) {
+                            val qrResult = scanImage(imageProxy)
+                            if (qrResult != null && qrResult.startsWith("MESH:")) {
+                                hasScanned = true // Stop scanning once we find a valid code
+                                onQrScanned(qrResult)
+                            }
+                        }
+                        imageProxy.close()
+                    }
+
+                    try {
+                        cameraProvider.unbindAll()
+                        cameraProvider.bindToLifecycle(
+                            lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalysis
+                        )
+                    } catch (e: Exception) { }
+                }, ContextCompat.getMainExecutor(context))
+                previewView
+            }
+        )
+    }
+}
+
+// Helper function to read the QR Code from the camera frame
+// Helper function to read the QR Code from the camera frame
+private fun scanImage(imageProxy: ImageProxy): String? {
+    return try {
+        // toBitmap() automatically fixes camera rotation and row padding!
+        val bitmap = imageProxy.toBitmap()
+        val intArray = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(intArray, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+
+        val source = RGBLuminanceSource(bitmap.width, bitmap.height, intArray)
+        val binaryBitmap = BinaryBitmap(HybridBinarizer(source))
+
+        val result = MultiFormatReader().decode(binaryBitmap)
+        result.text
+    } catch (e: Exception) {
+        null // Keep scanning if no QR code is found in this specific frame
     }
 }

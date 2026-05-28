@@ -12,30 +12,23 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
-import com.example.cappnan.ui.AddFriendScreen
 import com.example.cappnan.ui.ChatScreen
 import com.example.cappnan.ui.HomeScreen
 import com.example.cappnan.ui.theme.CAppNANTheme
-import kotlin.random.Random
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 // --- CONSTANTS ---
 private const val AWARE_SERVICE_NAME = "MyAwareService"
 private const val TAG = "AwareDebug"
-
-// LEGACY PROTOCOLS (For Friend Requests)
-private const val REQ_PREFIX = "REQ:"
-private const val ACK_PREFIX = "ACK:"
-
-
 
 class MainActivity : ComponentActivity() {
 
@@ -45,16 +38,16 @@ class MainActivity : ComponentActivity() {
     private var subscribeSessionRef: SubscribeDiscoverySession? = null
 
     // IDENTITY
-    private var myId: String = "" // "4592"
-    private var myNodeId: Int = 0 // 4592 (Int version for AODV)
+    private var myId: String = ""
+    private var myNodeId: Int = 0
     private var myName: String = ""
+    private lateinit var myPrivateKey: java.security.PrivateKey
 
-    // UI STATE
-    private val discoveredStrangers = mutableStateMapOf<String, PeerConnection>()
-    private val friendsList = mutableStateMapOf<String, PeerConnection>()
-    private val allMessages = mutableStateListOf<ChatMessage>()
+    // --- DATABASE ---
+    private lateinit var db: AppDatabase
 
-    // FIX 2: Variable was missing in your snippets
+    // UI & CONNECTION STATE
+    private val activeConnections = mutableStateMapOf<Int, PeerConnection>() // Maps NodeID -> Active Wi-Fi Connection
     private var currentChatTarget: String? = null
 
     // AODV STATE
@@ -63,72 +56,101 @@ class MainActivity : ComponentActivity() {
     private val messageBuffer = mutableMapOf<Int, MutableList<String>>()
     private var packetSequenceNumber = 0
 
-    // POPUP STATE
-    private var showConnectionRequest by mutableStateOf(false)
-    private var requestSenderName by mutableStateOf("")
-    private var requestSenderHandle: PeerHandle? = null
-    private var requestSession: DiscoverySession? = null
-
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { if (it.all { p -> p.value }) attachToWifiAware() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. GENERATE ID
+        // 1. INIT DATABASE
+        db = AppDatabase.getDatabase(this)
+
+        // 2. GENERATE ID & CRYPTO KEYS ON FIRST LAUNCH
         val prefs: SharedPreferences = getSharedPreferences("AppPrefs", MODE_PRIVATE)
         var storedId = prefs.getString("MY_ID", null)
-        if (storedId == null) {
-            storedId = Random.nextInt(1000, 9999).toString()
-            prefs.edit().putString("MY_ID", storedId).apply()
+        var storedPubKey = prefs.getString("MY_PUB_KEY", null)
+        var storedPrivKey = prefs.getString("MY_PRIV_KEY", null)
+
+        if (storedId == null || storedPubKey == null || storedPrivKey == null) {
+            storedId = kotlin.random.Random.nextInt(1000, 9999).toString()
+            val keyPair = CryptoManager.generateECCKeyPair()
+            storedPubKey = CryptoManager.encodeKeyToBase64(keyPair.public)
+            storedPrivKey = CryptoManager.encodeKeyToBase64(keyPair.private)
+
+            prefs.edit()
+                .putString("MY_ID", storedId)
+                .putString("MY_PUB_KEY", storedPubKey)
+                .putString("MY_PRIV_KEY", storedPrivKey)
+                .apply()
         }
-        myId = storedId!!
+
+        myId = storedId
         myNodeId = myId.toInt()
+        myPrivateKey = CryptoManager.decodeBase64ToPrivateKey(storedPrivKey!!)
+
+        // NOTE: We MUST keep the ID in this string. Wi-Fi Aware uses this broadcast to know who is who.
         myName = "${Build.MODEL} ($myId)"
+        val myPublicKeyBase64 = storedPubKey
 
         wifiAwareManager = getSystemService(Context.WIFI_AWARE_SERVICE) as? WifiAwareManager
 
         setContent {
             CAppNANTheme {
                 val navController = rememberNavController()
-
-                if (showConnectionRequest) {
-                    AlertDialog(
-                        onDismissRequest = { showConnectionRequest = false },
-                        title = { Text("Friend Request") },
-                        text = { Text("$requestSenderName wants to connect.") },
-                        confirmButton = { Button(onClick = { acceptConnection(); showConnectionRequest = false }) { Text("Allow") } },
-                        dismissButton = { Button(onClick = { showConnectionRequest = false }) { Text("Deny") } }
-                    )
-                }
+                val dbFriends by db.friendDao().getAllFriends().collectAsState(initial = emptyList())
 
                 NavHost(navController = navController, startDestination = "home") {
                     composable("home") {
+                        val friendNames = dbFriends.map { it.name }
                         HomeScreen(
                             myId = myId,
-                            friends = friendsList.keys.toList(),
+                            myName = myName,
+                            myPublicKey = myPublicKeyBase64,
+                            friends = friendNames,
                             onChatClick = { name ->
                                 currentChatTarget = name
                                 navController.navigate("chat")
                             },
-                            onAddFriendClick = { navController.navigate("add_friend") }
+                            onAddFriendClick = { navController.navigate("scan_qr") }
                         )
                     }
-                    composable("add_friend") {
-                        val strangers = discoveredStrangers.keys.filter { !friendsList.containsKey(it) }
-                        AddFriendScreen(
-                            discoveredDevices = strangers,
-                            onConnectClick = { name -> sendConnectionRequest(name) },
+                    composable("scan_qr") {
+                        com.example.cappnan.ui.ScanQrScreen(
+                            onQrScanned = { qrData ->
+                                val parts = qrData.split(":")
+                                if (parts.size == 4) {
+                                    val newFriendId = parts[1].toInt()
+                                    val newFriendName = parts[2]
+                                    val newFriendPubKey = parts[3]
+
+                                    lifecycleScope.launch(Dispatchers.IO) {
+                                        db.friendDao().insertFriend(FriendEntity(nodeId = newFriendId, name = newFriendName, publicKey = newFriendPubKey))
+                                    }
+                                    runOnUiThread {
+                                        Toast.makeText(this@MainActivity, "Added $newFriendName!", Toast.LENGTH_SHORT).show()
+                                        navController.popBackStack()
+                                    }
+                                }
+                            },
                             onBack = { navController.popBackStack() }
                         )
                     }
                     composable("chat") {
-                        val target = currentChatTarget ?: "Unknown"
-                        val msgs = allMessages.filter { it.senderName == target || (it.isFromMe && it.senderName == target) }
+                        val targetName = currentChatTarget ?: "Unknown"
+                        val targetId = extractIdFromName(targetName)
+
+                        val dbMessages by if (targetId != 0) {
+                            db.messageDao().getMessagesForFriend(targetId).collectAsState(initial = emptyList())
+                        } else {
+                            remember { mutableStateOf(emptyList()) }
+                        }
+
+                        val msgs = dbMessages.map { ChatMessage(it.text, it.isFromMe, targetName, it.timestamp) }
+
                         ChatScreen(
-                            peerName = target,
+                            peerName = targetName,
                             messages = msgs,
-                            onSendMessage = { msg -> sendMessage(msg) }, // Calls the UI-facing sendMessage
+                            onSendMessage = { msg -> sendMessage(msg) },
                             onBack = { navController.popBackStack() }
                         )
                     }
@@ -138,9 +160,8 @@ class MainActivity : ComponentActivity() {
         if (wifiAwareManager != null) requestPermissions()
     }
 
-    // --- SETUP ---
     private fun requestPermissions() {
-        val perms = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        val perms = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.CAMERA)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
         if (perms.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }) attachToWifiAware()
         else requestPermissionLauncher.launch(perms.toTypedArray())
@@ -172,74 +193,23 @@ class MainActivity : ComponentActivity() {
             override fun onSubscribeStarted(session: SubscribeDiscoverySession) { subscribeSessionRef = session }
             override fun onServiceDiscovered(peerHandle: PeerHandle, info: ByteArray, filter: List<ByteArray>) {
                 val peerName = String(info)
-                discoveredStrangers[peerName] = PeerConnection(peerHandle, subscribeSessionRef!!)
+                val peerId = extractIdFromName(peerName)
+                if (peerId != 0) activeConnections[peerId] = PeerConnection(peerHandle, subscribeSessionRef!!)
             }
             override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) { handleIncomingMessage(peerHandle, message, subscribeSessionRef!!) }
         }, null)
     }
 
-    // --- INCOMING HANDLER (SWITCHBOARD) ---
-    // --- INCOMING HANDLER (SWITCHBOARD) ---
     private fun handleIncomingMessage(handle: PeerHandle, message: ByteArray, session: DiscoverySession) {
-        val text = String(message)
-
-        // FIX: Check for Text Prefixes FIRST.
-        // If it starts with "REQ:" or "ACK:", handle it as a Friend Request immediately.
-        if (text.startsWith(REQ_PREFIX) || text.startsWith(ACK_PREFIX)) {
-            handleLegacyStringMessage(text, handle, session)
-            return
-        }
-
-        // If it wasn't a text command, TRY to parse as Binary AODV Packet
         val packet = PacketManager.parsePacket(message)
-
-        if (packet != null) {
-            handleAodvPacket(packet, handle, session)
-        }
+        if (packet != null) handleAodvPacket(packet, handle, session)
     }
 
-    // --- LEGACY FRIEND LOGIC ---
-    private fun handleLegacyStringMessage(text: String, handle: PeerHandle, session: DiscoverySession) {
-        if (text.startsWith(REQ_PREFIX)) {
-            val sender = text.removePrefix(REQ_PREFIX)
-            discoveredStrangers[sender] = PeerConnection(handle, session)
-            requestSenderName = sender; requestSenderHandle = handle; requestSession = session
-            showConnectionRequest = true
-        } else if (text.startsWith(ACK_PREFIX)) {
-            val sender = text.removePrefix(ACK_PREFIX)
-            // Save as Friend AND Routing Neighbor
-            friendsList[sender] = PeerConnection(handle, session)
-            // Also update Routing Table (Direct connection = 1 hop)
-            try {
-                val idStr = sender.substringAfterLast("(").substringBefore(")")
-                routingTable[idStr.toInt()] = RouteEntry(handle, session, 1)
-            } catch(e: Exception){}
-            runOnUiThread { Toast.makeText(this, "Friend Added!", Toast.LENGTH_SHORT).show() }
-        }
-    }
-    private fun sendConnectionRequest(targetName: String) {
-        val conn = discoveredStrangers[targetName] ?: return
-        try { conn.session.sendMessage(conn.handle, 0, "$REQ_PREFIX$myName".toByteArray()) } catch (e: Exception) {}
-    }
-    private fun acceptConnection() {
-        val handle = requestSenderHandle ?: return
-        val session = requestSession ?: return
-        friendsList[requestSenderName] = PeerConnection(handle, session)
-        // Update routing table for new friend
-        try {
-            val idStr = requestSenderName.substringAfterLast("(").substringBefore(")")
-            routingTable[idStr.toInt()] = RouteEntry(handle, session, 1)
-        } catch(e:Exception){}
-        try { session.sendMessage(handle, 0, "$ACK_PREFIX$myName".toByteArray()) } catch (e: Exception) {}
-    }
-
-    // --- AODV ROUTING LOGIC ---
     private fun handleAodvPacket(packet: AodvPacket, prevHandle: PeerHandle, prevSession: DiscoverySession) {
         val packetKey = "${packet.sourceId}-${packet.packetId}"
         if (seenPackets.contains(packetKey)) return
         seenPackets.add(packetKey)
 
-        // Update Reverse Route
         routingTable[packet.sourceId] = RouteEntry(prevHandle, prevSession, packet.hopCount + 1)
 
         when (packet.type) {
@@ -253,8 +223,31 @@ class MainActivity : ComponentActivity() {
             }
             TYPE_DATA -> {
                 if (packet.destId == myNodeId) {
-                    val senderName = friendsList.keys.find { it.contains(packet.sourceId.toString()) } ?: "User ${packet.sourceId}"
-                    runOnUiThread { allMessages.add(ChatMessage(packet.getPayloadString(), false, senderName)) }
+                    // X-RAY VISION ADDED BACK
+                    runOnUiThread { Toast.makeText(this@MainActivity, "Encrypted packet arrived!", Toast.LENGTH_SHORT).show() }
+
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        try {
+                            val friend = db.friendDao().getFriendById(packet.sourceId)
+                            if (friend == null || friend.publicKey == "pending_key") {
+                                runOnUiThread { Toast.makeText(this@MainActivity, "Decryption Failed: Missing QR Key!", Toast.LENGTH_LONG).show() }
+                                return@launch
+                            }
+
+                            val theirPublicKey = CryptoManager.decodeBase64ToPublicKey(friend.publicKey)
+                            val sharedSecret = CryptoManager.generateSharedSecret(myPrivateKey, theirPublicKey)
+
+                            val encryptedBytes = android.util.Base64.decode(packet.getPayloadString(), android.util.Base64.NO_WRAP)
+                            val decryptedText = CryptoManager.decryptMessage(encryptedBytes, sharedSecret)
+
+                            db.messageDao().insertMessage(MessageEntity(chatPartnerId = packet.sourceId, text = decryptedText, isFromMe = false))
+
+                            // X-RAY VISION ADDED BACK
+                            runOnUiThread { Toast.makeText(this@MainActivity, "Message Unlocked!", Toast.LENGTH_SHORT).show() }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Failed to decrypt incoming message", e)
+                        }
+                    }
                 } else {
                     forwardPacketToNextHop(packet)
                 }
@@ -267,13 +260,11 @@ class MainActivity : ComponentActivity() {
         val bytes = PacketManager.createPacket(TYPE_RREP, myNodeId, originId, packetSequenceNumber, 0, "")
         try { session.sendMessage(handle, 0, bytes) } catch (e: Exception) {}
     }
-
     private fun relayPacket(packet: AodvPacket, excludeHandle: PeerHandle) {
         val newHops = (packet.hopCount + 1).toByte()
         val bytes = PacketManager.createPacket(packet.type, packet.sourceId, packet.destId, packet.packetId, newHops, "")
-        friendsList.values.forEach { if(it.handle != excludeHandle) try { it.session.sendMessage(it.handle, 0, bytes) } catch(e:Exception){} }
+        activeConnections.values.forEach { if(it.handle != excludeHandle) try { it.session.sendMessage(it.handle, 0, bytes) } catch(e:Exception){} }
     }
-
     private fun forwardPacketToNextHop(packet: AodvPacket) {
         val nextHop = routingTable[packet.destId] ?: return
         val newHops = (packet.hopCount + 1).toByte()
@@ -281,19 +272,14 @@ class MainActivity : ComponentActivity() {
         try { nextHop.nextHopSession.sendMessage(nextHop.nextHopHandle, 0, bytes) } catch(e:Exception){}
     }
 
-    // --- UI SEND ACTION ---
-    // FIX 1: This is the missing function!
-    // REPLACE your sendMessage function with this (Uncommented):
-    // REPLACE your sendMessage function with this (Uncommented):
     private fun sendMessage(text: String) {
         val targetName = currentChatTarget ?: return
+        val targetId = extractIdFromName(targetName)
 
-        // Logic: Extract ID from "Samsung (4592)" -> 4592
-        val idString = targetName.substringAfterLast("(").substringBefore(")")
-        val targetId = idString.toIntOrNull()
-
-        if (targetId != null) {
-            // This triggers the AODV routing
+        if (targetId != 0) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                db.messageDao().insertMessage(MessageEntity(chatPartnerId = targetId, text = text, isFromMe = true))
+            }
             sendRoutedMessage(text, targetId)
         } else {
             Toast.makeText(this, "Invalid Target ID", Toast.LENGTH_SHORT).show()
@@ -312,22 +298,37 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun broadcastRREQ(targetId: Int) {
+        // X-RAY VISION ADDED BACK
+        if (activeConnections.isEmpty()) {
+            runOnUiThread { Toast.makeText(this, "Waiting for Wi-Fi Mesh to sync...", Toast.LENGTH_LONG).show() }
+            return
+        }
+
         packetSequenceNumber++
         val bytes = PacketManager.createPacket(TYPE_RREQ, myNodeId, targetId, packetSequenceNumber, 0, "")
-        friendsList.values.forEach { try { it.session.sendMessage(it.handle, 0, bytes) } catch (e: Exception) {} }
+        activeConnections.values.forEach { try { it.session.sendMessage(it.handle, 0, bytes) } catch (e: Exception) {} }
+        runOnUiThread { Toast.makeText(this, "Searching for route...", Toast.LENGTH_SHORT).show() }
     }
 
     private fun sendDataPacket(handle: PeerHandle, session: DiscoverySession, src: Int, dst: Int, text: String) {
-        packetSequenceNumber++
-        val bytes = PacketManager.createPacket(TYPE_DATA, src, dst, packetSequenceNumber, 0, text)
-        try {
-            session.sendMessage(handle, 0, bytes)
-            // UI Update for Self
-            if (src == myNodeId) {
-                val name = friendsList.keys.find { it.contains(dst.toString()) } ?: dst.toString()
-                runOnUiThread { allMessages.add(ChatMessage(text, true, name)) }
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val friend = db.friendDao().getFriendById(dst)
+                if (friend == null || friend.publicKey == "pending_key") return@launch
+
+                val theirPublicKey = CryptoManager.decodeBase64ToPublicKey(friend.publicKey)
+                val sharedSecret = CryptoManager.generateSharedSecret(myPrivateKey, theirPublicKey)
+                val encryptedBytes = CryptoManager.encryptMessage(text, sharedSecret)
+
+                val encryptedString = android.util.Base64.encodeToString(encryptedBytes, android.util.Base64.NO_WRAP)
+                packetSequenceNumber++
+                val bytes = PacketManager.createPacket(TYPE_DATA, src, dst, packetSequenceNumber, 0, encryptedString)
+
+                session.sendMessage(handle, 0, bytes)
+            } catch (e: Exception) {
+                Log.e(TAG, "Encryption or Sending failed", e)
             }
-        } catch(e:Exception){}
+        }
     }
 
     private fun flushMessageBuffer(targetId: Int) {
@@ -335,6 +336,11 @@ class MainActivity : ComponentActivity() {
         val route = routingTable[targetId] ?: return
         queue.forEach { sendDataPacket(route.nextHopHandle, route.nextHopSession, myNodeId, targetId, it) }
         messageBuffer.remove(targetId)
+    }
+
+    private fun extractIdFromName(name: String): Int {
+        val idString = name.substringAfterLast("(", "").substringBefore(")", "")
+        return idString.toIntOrNull() ?: 0
     }
 
     override fun onDestroy() { super.onDestroy(); wifiAwareSession?.close() }
